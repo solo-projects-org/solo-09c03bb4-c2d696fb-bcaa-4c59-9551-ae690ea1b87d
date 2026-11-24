@@ -119,7 +119,7 @@ async def get_registration(registration_id: str) -> RegistrationInfo:
             "rows": registration.target.rows,
         },
         overlap_pair_count=len(overlap.pairs),
-        overlap_area_m2=overlap.total_overlap_area,
+        overlap_area_m2=float(overlap.total_overlap_area),
         effective_target_cell_count=len(target_cells),
     )
 

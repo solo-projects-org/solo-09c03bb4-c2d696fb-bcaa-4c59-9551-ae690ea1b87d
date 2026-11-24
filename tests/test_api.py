@@ -66,6 +66,44 @@ def test_full_flow_register_transfer_and_conservation(client: TestClient):
     )
 
 
+def test_decimal_aligned_grid_transfer_has_full_coverage(client: TestClient):
+    """小数米格网完全对齐时，接口不应因覆盖比例浮点尾差报错。"""
+    payload = {
+        "source": {
+            "origin_x": 0.1,
+            "origin_y": 0.2,
+            "cell_width": 0.3,
+            "cell_height": 0.7,
+            "cols": 4,
+            "rows": 3,
+        },
+        "target": {
+            "origin_x": 0.1,
+            "origin_y": 0.2,
+            "cell_width": 0.3,
+            "cell_height": 0.7,
+            "cols": 4,
+            "rows": 3,
+        },
+    }
+    reg = client.post("/registrations", json=payload)
+    assert reg.status_code == 200, reg.text
+    reg_id = reg.json()["registration_id"]
+
+    resp = client.post(
+        f"/registrations/{reg_id}/transfer",
+        json={"depth_mm": [[10.0] * 4 for _ in range(3)]},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert len(data["results"]) == 12
+    assert all(cell["effective_coverage_ratio"] == 1.0 for cell in data["results"])
+    assert data["target_cell_area_m2"] == pytest.approx(0.21)
+    cons = data["conservation"]
+    assert cons["recorded_volume_outside_target_m3"] == 0.0
+    assert cons["conservation_residual_m3"] == 0.0
+
+
 def test_repeated_registration_is_reused(client: TestClient):
     first = client.post("/registrations", json=REGISTER_EXAMPLE).json()
     second = client.post("/registrations", json=REGISTER_EXAMPLE).json()

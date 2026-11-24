@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .geometry import GridMetrics
+from .geometry import GridMetrics, canonical_decimal_float
 
 
 class GridSpec(BaseModel):
@@ -36,10 +36,10 @@ class GridSpec(BaseModel):
 
     def to_metrics(self) -> GridMetrics:
         return GridMetrics(
-            origin_x=float(self.origin_x),
-            origin_y=float(self.origin_y),
-            cell_width=float(self.cell_width),
-            cell_height=float(self.cell_height),
+            origin_x=canonical_decimal_float(self.origin_x),
+            origin_y=canonical_decimal_float(self.origin_y),
+            cell_width=canonical_decimal_float(self.cell_width),
+            cell_height=canonical_decimal_float(self.cell_height),
             cols=int(self.cols),
             rows=int(self.rows),
         )

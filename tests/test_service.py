@@ -33,6 +33,20 @@ def test_identical_registration_reuses_overlap():
     assert registry.count() == 1
 
 
+def test_registration_reuses_geometry_with_float_roundoff():
+    """同一组十进制米值经不同浮点运算得到时，仍应识别为同一几何并复用。"""
+    registry = Registry()
+    first = registry.register(
+        spec(0.1 + 0.2, 0.0, 0.3, 0.7, 4, 3),
+        TGT,
+    )
+    second = registry.register(spec(0.3, 0.0, 0.3, 0.7, 4, 3), TGT)
+    assert second.registration_id == first.registration_id
+    assert second.reused is True
+    assert registry.count() == 1
+    assert registry.get(first.registration_id).source.origin_x == 0.3
+
+
 def test_geometry_change_creates_new_id_and_old_id_kept():
     registry = Registry()
     first = registry.register(SRC, TGT)
@@ -225,3 +239,168 @@ def test_area_weighted_mean_depth_with_varied_depths():
     assert cell.effective_area_m2 == pytest.approx(100.0)
     assert cell.mean_depth_mm == pytest.approx(10.0)
     assert cell.effective_volume_m3 == pytest.approx(1.0)
+
+
+def test_decimal_aligned_coverage_ratio_is_exactly_one():
+    """小数米格网完全对齐时，覆盖比例应为 1，不能被 1.0000000000000002 拒绝。"""
+    src = spec(0.1, 0.2, 0.3, 0.7, 4, 3)
+    tgt = spec(0.1, 0.2, 0.3, 0.7, 4, 3)
+    registry = Registry()
+    reg = registry.register(src, tgt)
+    response = registry.transfer(
+        reg.registration_id, [[1.0] * 4 for _ in range(3)]
+    )
+
+    assert len(response.results) == 12
+    assert all(cell.effective_coverage_ratio == 1.0 for cell in response.results)
+    assert all(
+        cell.effective_area_m2 == pytest.approx(0.3 * 0.7)
+        for cell in response.results
+    )
+    assert response.target_cell_area_m2 == pytest.approx(0.21)
+
+    cons = response.conservation
+    assert cons.recorded_volume_outside_target_m3 == 0.0
+    assert cons.conservation_residual_m3 == 0.0
+    assert cons.transferred_volume_m3 == pytest.approx(
+        cons.recorded_source_volume_m3
+    )
+
+
+def test_target_containing_source_reports_zero_outside_volume():
+    """目标范围完全包住源格网时，目标外有记录水量必须精确为 0。"""
+    src = spec(0.1, 0.2, 0.3, 0.7, 3, 3)
+    tgt = spec(-1.0, -1.0, 10.0, 10.0, 1, 1)
+    registry = Registry()
+    reg = registry.register(src, tgt)
+    response = registry.transfer(
+        reg.registration_id, [[5.0] * 3 for _ in range(3)]
+    )
+
+    cons = response.conservation
+    assert cons.recorded_volume_outside_target_m3 == 0.0
+    assert cons.conservation_residual_m3 == 0.0
+    assert cons.transferred_volume_m3 == pytest.approx(
+        cons.recorded_source_volume_m3
+    )
+    cell = response.results[0]
+    assert cell.effective_area_m2 == pytest.approx(9 * 0.3 * 0.7)
+    assert cell.effective_coverage_ratio == pytest.approx(
+        9 * 0.3 * 0.7 / 100.0
+    )
+
+
+def test_partial_coverage_decimal_strip_volume_is_counted_outside():
+    """部分覆盖时，窄条雨量按“源格目标外面积 × 当天雨深”核算，不能被抹掉。"""
+    # 源 10 列 × 1 行，每格 0.1 m × 0.7 m；目标只覆盖 x ∈ [0, 0.35)。
+    src = spec(0.0, 0.0, 0.1, 0.7, 10, 1)
+    tgt = spec(0.0, 0.0, 0.35, 0.7, 1, 1)
+    registry = Registry()
+    reg = registry.register(src, tgt)
+
+    depth = 10.0
+    response = registry.transfer(reg.registration_id, [[depth] * 10])
+    cell = response.results[0]
+    cons = response.conservation
+
+    covered_area = 0.35 * 0.7
+    total_area = 10 * 0.1 * 0.7
+    # 目标格只收下 x[0, 0.35)，其中第 3 个源格只贡献 0.05 m 宽窄条。
+    assert cell.effective_area_m2 == pytest.approx(covered_area)
+    assert cell.effective_volume_m3 == pytest.approx(
+        covered_area * depth * 0.001
+    )
+    # 目标外 = 每格源格落在目标外的面积 × 当天雨深逐格求和。
+    assert cons.recorded_volume_outside_target_m3 == pytest.approx(
+        (total_area - covered_area) * depth * 0.001
+    )
+    assert cons.recorded_source_volume_m3 == pytest.approx(
+        total_area * depth * 0.001
+    )
+    assert cons.conservation_residual_m3 == 0.0
+
+
+def test_partial_coverage_narrow_strip_keeps_its_own_depth():
+    """窄条雨量按窄条自己的当天雨深核算，不能用平均雨深抹掉或摊平。"""
+    # 源 4 列 × 1 行，每格 100 m × 100 m；目标只覆盖 x ∈ [0, 350)，
+    # 第 3 个源格只剩 50 m 宽窄条落在目标内。
+    src = spec(0.0, 0.0, 100.0, 100.0, 4, 1)
+    tgt = spec(0.0, 0.0, 350.0, 100.0, 1, 1)
+    registry = Registry()
+    reg = registry.register(src, tgt)
+
+    response = registry.transfer(reg.registration_id, [[10.0, 20.0, 30.0, 40.0]])
+    cell = response.results[0]
+    cons = response.conservation
+
+    # 目标内：3 整格 + 第 3 格的 50 m 窄条，各自使用本格雨深。
+    # 每整格面积 100 m × 100 m = 10 000 m²。
+    expected_volume = (
+        10_000 * 10 + 10_000 * 20 + 10_000 * 30 + 5_000 * 40
+    ) * 0.001
+    assert cell.effective_volume_m3 == pytest.approx(expected_volume)
+    assert cell.effective_area_m2 == pytest.approx(35_000.0)
+    # 窄条没有被抹掉，也没有把整格 40 mm 都算进来。
+    assert cell.mean_depth_mm == pytest.approx(
+        (10_000 * 10 + 10_000 * 20 + 10_000 * 30 + 5_000 * 40) / 35_000.0
+    )
+    # 目标外只有第 3 格剩下的 50 m 窄条，按该格 40 mm 核算。
+    assert cons.recorded_volume_outside_target_m3 == pytest.approx(
+        5_000 * 40 * 0.001
+    )
+    assert cons.conservation_residual_m3 == 0.0
+
+
+def test_target_cell_covered_by_multiple_partial_sources_reports_one():
+    """目标格被多个源格拼合完全覆盖（每格只是部分交叠）时，比例报 1。"""
+    # 源 10 列 × 0.1 m 宽；目标格 x[0.15, 0.85) 完全落在源范围内，
+    # 但由 7 个源格的完整或部分交叠拼成。
+    src = spec(0.0, 0.0, 0.1, 0.5, 10, 1)
+    tgt = spec(0.15, 0.0, 0.7, 0.5, 1, 1)
+    registry = Registry()
+    reg = registry.register(src, tgt)
+    response = registry.transfer(reg.registration_id, [[10.0] * 10])
+
+    cell = response.results[0]
+    assert cell.effective_coverage_ratio == 1.0
+    assert cell.effective_area_m2 == pytest.approx(0.7 * 0.5)
+    assert cell.effective_volume_m3 == pytest.approx(0.7 * 0.5 * 10 * 0.001)
+
+    # 目标格完全被覆盖，但源格网左右两侧仍落在目标外，守恒必须分清。
+    cons = response.conservation
+    assert cons.recorded_volume_outside_target_m3 == pytest.approx(
+        (10 * 0.1 - 0.7) * 0.5 * 10 * 0.001
+    )
+    assert cons.conservation_residual_m3 == 0.0
+
+
+def test_equally_shifting_both_grids_does_not_change_results():
+    """两张格网一起平移后，各目标格覆盖、雨量与守恒明细都不应变化。"""
+    base_src = dict(origin_x=0.1, origin_y=0.2, cell_width=0.3, cell_height=0.7, cols=10, rows=10)
+    base_tgt = dict(origin_x=0.15, origin_y=0.25, cell_width=0.3, cell_height=0.7, cols=10, rows=10)
+    matrix = [
+        [float((r * 10 + c) % 7) for c in range(10)] for r in range(10)
+    ]
+
+    def run(src_kwargs, tgt_kwargs):
+        registry = Registry()
+        reg = registry.register(
+            GridSpec(**src_kwargs), GridSpec(**tgt_kwargs)
+        )
+        return registry.transfer(reg.registration_id, matrix)
+
+    baseline = run(base_src, base_tgt)
+
+    for shift in (0.1, 0.3, 0.7, 1.1, 12.34):
+        src = {**base_src, "origin_x": base_src["origin_x"] + shift,
+               "origin_y": base_src["origin_y"] + shift}
+        tgt = {**base_tgt, "origin_x": base_tgt["origin_x"] + shift,
+               "origin_y": base_tgt["origin_y"] + shift}
+        shifted = run(src, tgt)
+
+        assert [c.model_dump() for c in shifted.results] == [
+            c.model_dump() for c in baseline.results
+        ], f"平移 {shift} 后目标格结果变化"
+        assert shifted.conservation == baseline.conservation, (
+            f"平移 {shift} 后守恒明细变化"
+        )

@@ -114,3 +114,80 @@ def test_grid_metrics_extent():
     assert g.max_x == 18
     assert g.max_y == 10
     assert g.cell_area == 6
+
+
+def test_decimal_boundary_equal_to_cell_line_is_not_a_sliver():
+    """边界十进制值等于若干格宽之和时，不得多出一条零宽/浮点尾差窄条。"""
+    src = make_grid(0.0, 0.0, 0.1, 0.7, 10, 1)
+    for width in (0.3, 0.1 + 0.1 + 0.1):
+        table = build_overlap(src, make_grid(0.0, 0.0, width, 0.7, 1, 1))
+        assert len(table.pairs) == 3
+        assert table.total_overlap_area == pytest.approx(0.21)
+
+
+def test_decimal_aligned_grids_are_exactly_one_to_one():
+    """小数米格网完全对齐时，每格与同位置格精确一一交叠，面积无浮点尾差。"""
+    src = make_grid(0.1, 0.2, 0.3, 0.7, 10, 10)
+    tgt = make_grid(0.1, 0.2, 0.3, 0.7, 10, 10)
+    table = build_overlap(src, tgt)
+
+    assert len(table.pairs) == 100
+    assert all(p.area_m2 == pytest.approx(0.21) for p in table.pairs)
+    assert table.total_overlap_area == pytest.approx(21.0)
+    assert {
+        (p.target_row, p.target_col, p.source_row, p.source_col)
+        for p in table.pairs
+    } == {(r, c, r, c) for r in range(10) for c in range(10)}
+
+
+def test_decimal_edges_that_float_arithmetic_gets_wrong():
+    """0.1/0.3/0.7 这类十进制边界不得因浮点误差多算或漏算窄条。"""
+    src = make_grid(0.0, 0.0, 0.1, 0.7, 10, 1)
+    tgt = make_grid(0.0, 0.0, 0.35, 0.7, 1, 1)
+    table = build_overlap(src, tgt)
+
+    # 目标 x[0, 0.35)：源列 0、1、2 全部在内，列 3 只有 [0.3, 0.35) 的窄条。
+    assert len(table.pairs) == 4
+    by_source_col = {p.source_col: p.area_m2 for p in table.pairs}
+    assert by_source_col[0] == pytest.approx(0.07)
+    assert by_source_col[1] == pytest.approx(0.07)
+    assert by_source_col[2] == pytest.approx(0.07)
+    assert by_source_col[3] == pytest.approx(0.05 * 0.7)
+    assert table.total_overlap_area == pytest.approx(0.35 * 0.7)
+
+    # 目标右边界恰好落在源格线上（0.3 是 3 个 0.1 格宽之和）：
+    # 只应得到列 0..2 三对整格，不得因 0.30000000000000004 多切一条窄条。
+    tgt2 = make_grid(0.0, 0.0, 0.3, 0.7, 1, 1)
+    table2 = build_overlap(src, tgt2)
+    assert len(table2.pairs) == 3
+    assert table2.total_overlap_area == pytest.approx(0.3 * 0.7)
+
+
+def test_translation_of_both_grids_keeps_overlap_unchanged():
+    """两张格网一起平移（含小数平移量），交叠格对与面积应完全不变。"""
+    base_src = (0.1, 0.2, 0.3, 0.7, 10, 10)
+    base_tgt = (0.15, 0.25, 0.3, 0.7, 10, 10)
+    baseline = build_overlap(make_grid(*base_src), make_grid(*base_tgt))
+    baseline_pairs = {
+        (p.target_row, p.target_col, p.source_row, p.source_col): p.area_m2
+        for p in baseline.pairs
+    }
+
+    for shift in (0.1, 0.2, 0.3, 0.7, 1.1, 12.34):
+        src = make_grid(
+            base_src[0] + shift,
+            base_src[1] + shift,
+            *base_src[2:],
+        )
+        tgt = make_grid(
+            base_tgt[0] + shift,
+            base_tgt[1] + shift,
+            *base_tgt[2:],
+        )
+        table = build_overlap(src, tgt)
+        pairs = {
+            (p.target_row, p.target_col, p.source_row, p.source_col): p.area_m2
+            for p in table.pairs
+        }
+        assert pairs == baseline_pairs, f"平移 {shift} 后交叠格对或面积变化"
+        assert table.total_overlap_area == baseline.total_overlap_area
